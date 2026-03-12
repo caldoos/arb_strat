@@ -1,0 +1,140 @@
+{
+  "log_level": "INFO",
+  "poll_interval_seconds": 5,
+  "quote_capital": 1000.0,
+  "dry_run": true,
+  "logging": {
+    "file_path": "logs/arb_strat.log",
+    "max_bytes": 5000000,
+    "backup_count": 3,
+    "telegram_level": "WARNING"
+  },
+  "telegram": {
+    "enabled": false,
+    "token_env": "TELEGRAM_TOKEN",
+    "notification_chat_id_env": "TELEGRAM_NOTIFICATION_CHAT_ID",
+    "logs_chat_id_env": "TELEGRAM_LOGS_CHAT_ID",
+    "commands_enabled": false,
+    "command_poll_seconds": 2.0,
+    "command_long_poll_seconds": 10,
+    "notify_on_startup": true,
+    "notify_on_shutdown": true,
+    "notify_on_opportunity": true,
+    "heartbeat_enabled": false,
+    "heartbeat_interval_cycles": 30,
+    "min_edge_bps": 0.0,
+    "daily_summary_enabled": false,
+    "daily_summary_hour_utc": 0,
+    "daily_summary_timezone": "UTC"
+  },
+  "market_data": {
+    "enabled": true,
+    "warmup_seconds": 2.0,
+    "rest_fallback": true
+  },
+  "risk": {
+    "enabled": true,
+    "allow_live_triangular": false,
+    "allow_live_cross_exchange": true,
+    "min_order_notional": 10.0,
+    "max_order_notional": 250.0,
+    "max_opportunity_notional": 500.0,
+    "reserve_balance_pct": 0.05,
+    "max_slippage_bps": 10.0,
+    "max_quote_age_ms": 3000,
+    "max_live_orders_per_cycle": 2,
+    "max_consecutive_failures": 3,
+    "pause_on_partial_fill": true,
+    "pause_on_execution_error": true,
+    "max_asset_balance_by_exchange": {
+      "binance": {
+        "BTC": 0.25,
+        "ETH": 3.0,
+        "SOL": 75.0,
+        "USDT": 5000.0,
+        "USD": 5000.0
+      },
+      "coinbase": {
+        "BTC": 0.25,
+        "ETH": 3.0,
+        "SOL": 75.0,
+        "USDT": 5000.0,
+        "USD": 5000.0
+      },
+      "okx": {
+        "BTC": 0.25,
+        "ETH": 3.0,
+        "SOL": 75.0,
+        "USDT": 5000.0,
+        "USD": 5000.0
+      }
+    }
+  },
+  "state": {
+    "enabled": true,
+    "directory": "state",
+    "snapshot_file": "runtime_state.json",
+    "event_log_file": "events.jsonl",
+    "max_recent_records": 50
+  },
+  "exchanges": [
+    {
+      "name": "binance",
+      "enabled": true,
+      "sandbox": false,
+      "taker_fee_bps": 10.0,
+      "api_key_env": "BINANCE_API_KEY",
+      "secret_env": "BINANCE_API_SECRET"
+    },
+    {
+      "name": "coinbase",
+      "enabled": true,
+      "sandbox": false,
+      "taker_fee_bps": 60.0,
+      "api_key_env": "COINBASE_API_KEY",
+      "secret_env": "COINBASE_API_SECRET",
+      "password_env": "COINBASE_API_PASSPHRASE"
+    },
+    {
+      "name": "okx",
+      "enabled": true,
+      "sandbox": false,
+      "taker_fee_bps": 10.0,
+      "api_key_env": "OKX_API_KEY",
+      "secret_env": "OKX_API_SECRET",
+      "password_env": "OKX_API_PASSPHRASE"
+    }
+  ],
+  "triangular": {
+    "enabled": true,
+    "exchanges": [
+      "binance",
+      "coinbase",
+      "okx"
+    ],
+    "base_assets": [
+      "BTC",
+      "ETH",
+      "SOL"
+    ],
+    "settlement_assets": [
+      "USDT",
+      "USD"
+    ],
+    "min_edge_bps": 8.0,
+    "max_opportunities": 5
+  },
+  "cross_exchange": {
+    "enabled": true,
+    "symbols": [
+      "BTC/USDT",
+      "ETH/USDT",
+      "SOL/USDT",
+      "BTC/USD",
+      "ETH/USD",
+      "SOL/USD"
+    ],
+    "min_edge_bps": 10.0,
+    "max_opportunities": 5
+  }
+}

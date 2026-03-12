@@ -1,0 +1,13 @@
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.log
+.env
+.env.*
+config.json
+config.local.json
+logs/
+state/
