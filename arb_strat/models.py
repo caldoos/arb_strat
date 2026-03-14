@@ -56,6 +56,7 @@ class ExecutionRecord:
     expected_pnl: float
     pnl_currency: str
     order_count: int
+    execution_group_id: str = ""
     reason: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -72,6 +73,7 @@ class ExecutionRecord:
         expected_pnl: float,
         pnl_currency: str,
         order_count: int,
+        execution_group_id: str = "",
         reason: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> "ExecutionRecord":
@@ -87,6 +89,7 @@ class ExecutionRecord:
             expected_pnl=expected_pnl,
             pnl_currency=pnl_currency,
             order_count=order_count,
+            execution_group_id=execution_group_id,
             reason=reason,
             metadata=metadata or {},
         )
@@ -142,6 +145,7 @@ class OrderStatusRecord:
     filled: float
     remaining: float
     timestamp: str
+    execution_group_id: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -158,4 +162,5 @@ class FillRecord:
     fee_cost: float
     fee_currency: str
     timestamp: str
+    execution_group_id: str = ""
     raw: dict[str, Any] = field(default_factory=dict)

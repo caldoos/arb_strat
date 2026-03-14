@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from uuid import uuid4
 
 from arb_strat.config import AppConfig
 from arb_strat.execution.live import LiveExecutionError, LiveExecutor
@@ -37,11 +38,24 @@ class ExecutionController:
     def execute(self, opportunity: Opportunity, *, live: bool) -> ExecutionRecord:
         """Execute or reject one opportunity and persist the resulting record."""
         mode = "live" if live else "paper"
+        execution_group_id = uuid4().hex
         try:
             prepared = self.risk.prepare(opportunity, self.clients, live=live)
         except RiskViolation as exc:
-            record = self._record_rejection(opportunity, mode=mode, reason=str(exc))
+            record = self._record_rejection(
+                opportunity,
+                mode=mode,
+                reason=str(exc),
+                execution_group_id=execution_group_id,
+            )
             return record
+
+        self.state_store.register_execution_group(
+            execution_group_id,
+            prepared.opportunity,
+            mode=mode,
+            total_notional=prepared.total_notional,
+        )
 
         if live:
             next_order_count = self.live_orders_executed_this_cycle + len(prepared.opportunity.orders)
@@ -50,13 +64,14 @@ class ExecutionController:
                     prepared.opportunity,
                     mode=mode,
                     reason="per-cycle live order limit reached",
+                    execution_group_id=execution_group_id,
                 )
 
         try:
             if live:
                 responses = self.live_executor.execute(prepared.opportunity)
-                self._record_submitted_orders(prepared, responses)
-                self._reconcile_live_orders(prepared, responses)
+                self._record_submitted_orders(prepared, responses, execution_group_id=execution_group_id)
+                self._reconcile_live_orders(prepared, responses, execution_group_id=execution_group_id)
                 self.live_orders_executed_this_cycle += len(prepared.opportunity.orders)
                 record = ExecutionRecord.now(
                     mode=mode,
@@ -68,8 +83,10 @@ class ExecutionController:
                     expected_pnl=prepared.opportunity.expected_pnl,
                     pnl_currency=prepared.opportunity.pnl_currency,
                     order_count=len(prepared.opportunity.orders),
+                    execution_group_id=execution_group_id,
                     metadata={
                         "total_notional": prepared.total_notional,
+                        "execution_group_id": execution_group_id,
                         "responses": responses,
                     },
                 )
@@ -85,14 +102,22 @@ class ExecutionController:
                     expected_pnl=prepared.opportunity.expected_pnl,
                     pnl_currency=prepared.opportunity.pnl_currency,
                     order_count=len(prepared.opportunity.orders),
-                    metadata={"total_notional": prepared.total_notional},
+                    execution_group_id=execution_group_id,
+                    metadata={
+                        "total_notional": prepared.total_notional,
+                        "execution_group_id": execution_group_id,
+                    },
                 )
             self.risk.register_success()
             self.state_store.record_execution(record)
             return record
         except LiveExecutionError as exc:
             if exc.responses and self.config.risk.cancel_on_partial_failure:
-                self._attempt_cancel_open_legs(prepared, exc.responses)
+                self._attempt_cancel_open_legs(
+                    prepared,
+                    exc.responses,
+                    execution_group_id=execution_group_id,
+                )
             if exc.responses and self.config.risk.pause_on_partial_fill:
                 self.risk.pause(
                     "paused immediately due to partial live fill / leg mismatch"
@@ -109,9 +134,11 @@ class ExecutionController:
                 expected_pnl=prepared.opportunity.expected_pnl,
                 pnl_currency=prepared.opportunity.pnl_currency,
                 order_count=len(prepared.opportunity.orders),
+                execution_group_id=execution_group_id,
                 reason=str(exc),
                 metadata={
                     "total_notional": prepared.total_notional,
+                    "execution_group_id": execution_group_id,
                     "responses": exc.responses,
                 },
             )
@@ -130,8 +157,12 @@ class ExecutionController:
                 expected_pnl=prepared.opportunity.expected_pnl,
                 pnl_currency=prepared.opportunity.pnl_currency,
                 order_count=len(prepared.opportunity.orders),
+                execution_group_id=execution_group_id,
                 reason=str(exc),
-                metadata={"total_notional": prepared.total_notional},
+                metadata={
+                    "total_notional": prepared.total_notional,
+                    "execution_group_id": execution_group_id,
+                },
             )
             self.state_store.record_execution(record)
             return record
@@ -166,7 +197,14 @@ class ExecutionController:
                 records.append(record)
         return records
 
-    def _record_rejection(self, opportunity: Opportunity, *, mode: str, reason: str) -> ExecutionRecord:
+    def _record_rejection(
+        self,
+        opportunity: Opportunity,
+        *,
+        mode: str,
+        reason: str,
+        execution_group_id: str,
+    ) -> ExecutionRecord:
         """Persist a rejected opportunity record."""
         record = ExecutionRecord.now(
             mode=mode,
@@ -178,7 +216,9 @@ class ExecutionController:
             expected_pnl=opportunity.expected_pnl,
             pnl_currency=opportunity.pnl_currency,
             order_count=len(opportunity.orders),
+            execution_group_id=execution_group_id,
             reason=reason,
+            metadata={"execution_group_id": execution_group_id},
         )
         self.state_store.record_execution(record)
         return record
@@ -187,12 +227,24 @@ class ExecutionController:
         self,
         prepared: PreparedOpportunity,
         responses: list[dict],
+        *,
+        execution_group_id: str,
     ) -> None:
         """Record initial submitted order responses as order-status snapshots."""
         for order, response in zip(prepared.opportunity.orders, responses):
-            record = self._to_order_status_record(order.exchange, response, fallback_order=order)
+            record = self._to_order_status_record(
+                order.exchange,
+                response,
+                fallback_order=order,
+                execution_group_id=execution_group_id,
+            )
             self.state_store.record_order_status(record)
-            fill = self._to_fill_record(order.exchange, response, fallback_order=order)
+            fill = self._to_fill_record(
+                order.exchange,
+                response,
+                fallback_order=order,
+                execution_group_id=execution_group_id,
+            )
             if fill is not None:
                 self.state_store.record_fill(fill)
 
@@ -200,6 +252,8 @@ class ExecutionController:
         self,
         prepared: PreparedOpportunity,
         responses: list[dict],
+        *,
+        execution_group_id: str,
     ) -> None:
         """Poll exchange order state for submitted live orders and store the results."""
         if not self.config.risk.reconcile_live_orders:
@@ -221,9 +275,19 @@ class ExecutionController:
                     all_terminal = False
                     continue
 
-                record = self._to_order_status_record(order.exchange, latest, fallback_order=order)
+                record = self._to_order_status_record(
+                    order.exchange,
+                    latest,
+                    fallback_order=order,
+                    execution_group_id=execution_group_id,
+                )
                 self.state_store.record_order_status(record)
-                fill = self._to_fill_record(order.exchange, latest, fallback_order=order)
+                fill = self._to_fill_record(
+                    order.exchange,
+                    latest,
+                    fallback_order=order,
+                    execution_group_id=execution_group_id,
+                )
                 if fill is not None:
                     self.state_store.record_fill(fill)
                 if record.status in {"open", "partially_filled"}:
@@ -238,6 +302,8 @@ class ExecutionController:
         self,
         prepared: PreparedOpportunity,
         responses: list[dict],
+        *,
+        execution_group_id: str,
     ) -> None:
         """Attempt to cancel any already-accepted live legs after a later leg fails."""
         for order, response in zip(prepared.opportunity.orders, responses):
@@ -246,7 +312,12 @@ class ExecutionController:
                 continue
             try:
                 latest = self.clients[order.exchange].fetch_order(order_id, order.symbol)
-                record = self._to_order_status_record(order.exchange, latest, fallback_order=order)
+                record = self._to_order_status_record(
+                    order.exchange,
+                    latest,
+                    fallback_order=order,
+                    execution_group_id=execution_group_id,
+                )
                 self.state_store.record_order_status(record)
                 if record.status in {"open", "partially_filled"}:
                     cancel_response = self.clients[order.exchange].cancel_order(order_id, order.symbol)
@@ -254,6 +325,7 @@ class ExecutionController:
                         order.exchange,
                         cancel_response,
                         fallback_order=order,
+                        execution_group_id=execution_group_id,
                     )
                     self.state_store.record_order_status(cancel_record)
             except Exception as exc:
@@ -268,6 +340,7 @@ class ExecutionController:
         payload: dict,
         *,
         fallback_order=None,
+        execution_group_id: str = "",
     ) -> OrderStatusRecord:
         """Normalize an exchange order payload into the internal status record."""
         status = str(payload.get("status") or "unknown").lower()
@@ -305,6 +378,7 @@ class ExecutionController:
             filled=filled,
             remaining=remaining,
             timestamp=timestamp,
+            execution_group_id=execution_group_id,
             raw=payload,
         )
 
@@ -314,6 +388,7 @@ class ExecutionController:
         payload: dict,
         *,
         fallback_order=None,
+        execution_group_id: str = "",
     ) -> FillRecord | None:
         """Normalize a filled or partially-filled order payload into a fill record."""
         filled = float(payload.get("filled") or 0.0)
@@ -331,5 +406,6 @@ class ExecutionController:
             fee_cost=float(fee.get("cost") or 0.0),
             fee_currency=str(fee.get("currency") or ""),
             timestamp=str(payload.get("datetime") or payload.get("timestamp") or ""),
+            execution_group_id=execution_group_id,
             raw=payload,
         )

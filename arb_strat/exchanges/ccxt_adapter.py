@@ -27,6 +27,8 @@ class CCXTExchangeAdapter:
         self.rest_fallback = True
         exchange_cls = getattr(ccxt, settings.name)
         self.exchange = exchange_cls({"enableRateLimit": True})
+        if settings.hostname:
+            self.exchange.hostname = settings.hostname
         self._markets: dict[str, Any] = {}
         self._configure_auth()
 
@@ -36,11 +38,31 @@ class CCXTExchangeAdapter:
     def _configure_auth(self) -> None:
         """Populate CCXT credentials from environment variables when provided."""
         if self.settings.api_key_env:
-            self.exchange.apiKey = os.getenv(self.settings.api_key_env, "")
+            self.exchange.apiKey = self._read_env_value(self.settings.api_key_env)
         if self.settings.secret_env:
-            self.exchange.secret = os.getenv(self.settings.secret_env, "")
+            secret = self._read_env_value(self.settings.secret_env)
+            if self.name == "coinbase":
+                secret = self._normalize_coinbase_secret(secret)
+            self.exchange.secret = secret
         if self.settings.password_env:
-            self.exchange.password = os.getenv(self.settings.password_env, "")
+            self.exchange.password = self._read_env_value(self.settings.password_env)
+
+    @staticmethod
+    def _read_env_value(env_name: str) -> str:
+        """Read an env var and strip only accidental surrounding whitespace."""
+        return os.getenv(env_name, "").strip()
+
+    @staticmethod
+    def _normalize_coinbase_secret(secret: str) -> str:
+        """Convert one-line PEM env values back into the multiline form CCXT expects."""
+        normalized = secret.strip()
+        if not normalized:
+            return normalized
+        if normalized[:1] == normalized[-1:] and normalized[:1] in {"'", '"'}:
+            normalized = normalized[1:-1].strip()
+        if "\\n" in normalized:
+            normalized = normalized.replace("\\n", "\n")
+        return normalized
 
     def load_markets(self) -> None:
         """Load exchange markets once and cache them for later symbol checks."""

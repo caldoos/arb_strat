@@ -10,6 +10,7 @@ from pathlib import Path
 from threading import Lock
 
 from arb_strat.config import StateSettings
+from arb_strat.ledger import SQLiteLedger
 from arb_strat.models import (
     BalanceSnapshot,
     ErrorRecord,
@@ -29,6 +30,7 @@ class StateStore:
         self.directory = Path(settings.directory)
         self.snapshot_path = self.directory / settings.snapshot_file
         self.event_log_path = self.directory / settings.event_log_file
+        self.database_path = self.directory / settings.database_file
         self._lock = Lock()
 
         self.recent_executions: deque[ExecutionRecord] = deque(maxlen=settings.max_recent_records)
@@ -38,14 +40,34 @@ class StateStore:
         self.last_balance_snapshots: dict[str, BalanceSnapshot] = {}
         self.open_orders: dict[str, OrderStatusRecord] = {}
         self.paper_pnl_by_currency: dict[str, float] = {}
+        self.live_pnl_estimate_usd_by_day: dict[str, float] = {}
         self.execution_paused = False
         self.pause_reason = ""
         self.runtime: dict[str, object] = {}
         self.daily_summary: dict[str, object] = self._new_daily_summary_payload()
+        self.ledger = SQLiteLedger(self.database_path) if self.settings.enabled else None
 
         if self.settings.enabled:
             self.directory.mkdir(parents=True, exist_ok=True)
             self._write_snapshot()
+
+    def register_execution_group(
+        self,
+        execution_group_id: str,
+        opportunity: Opportunity,
+        *,
+        mode: str,
+        total_notional: float,
+    ) -> None:
+        """Persist the parent execution-group record in the SQLite ledger."""
+        if self.ledger is None:
+            return
+        self.ledger.register_execution_group(
+            execution_group_id,
+            opportunity,
+            mode=mode,
+            total_notional=total_notional,
+        )
 
     def update_runtime(self, **values: object) -> None:
         """Update the top-level runtime snapshot fields."""
@@ -83,10 +105,21 @@ class StateStore:
                     self.paper_pnl_by_currency.get(record.pnl_currency, 0.0)
                     + record.expected_pnl
                 )
+            live_pnl_delta = self._live_pnl_delta(record)
+            if live_pnl_delta != 0.0:
+                day_key = record.timestamp[:10]
+                self.live_pnl_estimate_usd_by_day[day_key] = (
+                    self.live_pnl_estimate_usd_by_day.get(day_key, 0.0) + live_pnl_delta
+                )
             expected_pnl = self.daily_summary["expected_pnl_by_currency"]
             expected_pnl[record.pnl_currency] = (
                 expected_pnl.get(record.pnl_currency, 0.0) + record.expected_pnl
             )
+            if self.ledger and record.execution_group_id:
+                self.ledger.update_execution_group_status(
+                    record.execution_group_id,
+                    status=record.status,
+                )
             self._write_event({"type": "execution", **asdict(record)})
             self._write_snapshot()
 
@@ -99,6 +132,8 @@ class StateStore:
                 self.open_orders[key] = record
             else:
                 self.open_orders.pop(key, None)
+            if self.ledger:
+                self.ledger.record_order_status(record)
             self._write_event({"type": "order_status", **asdict(record)})
             self._write_snapshot()
 
@@ -106,6 +141,8 @@ class StateStore:
         """Append a normalized fill record to memory and disk."""
         with self._lock:
             self.recent_fills.appendleft(record)
+            if self.ledger:
+                self.ledger.record_fill(record)
             self._write_event({"type": "fill", **asdict(record)})
             self._write_snapshot()
 
@@ -194,6 +231,17 @@ class StateStore:
         with self._lock:
             return dict(self.paper_pnl_by_currency)
 
+    def current_live_pnl_estimate_usd(self) -> float:
+        """Return the current UTC-day live pnl estimate used for kill-switch checks."""
+        with self._lock:
+            day_key = datetime.now(timezone.utc).date().isoformat()
+            return float(self.live_pnl_estimate_usd_by_day.get(day_key, 0.0))
+
+    def open_notional_estimate(self) -> float:
+        """Return the current notional tied up in open orders."""
+        with self._lock:
+            return float(sum(record.amount * record.price for record in self.open_orders.values()))
+
     def snapshot(self) -> dict[str, object]:
         """Return a JSON-friendly runtime snapshot."""
         with self._lock:
@@ -203,6 +251,12 @@ class StateStore:
         """Return a copy of the current daily summary counters."""
         with self._lock:
             return json.loads(json.dumps(self.daily_summary))
+
+    def realized_pnl_summary(self) -> dict[str, object]:
+        """Return realized-pnl aggregates from the SQLite execution ledger."""
+        if self.ledger is None:
+            return {"totals": {}, "today": {}, "recent": []}
+        return self.ledger.realized_pnl_summary()
 
     def mark_daily_summary_sent(self, sent_at: datetime | None = None) -> None:
         """Reset the daily summary window after a report has been sent."""
@@ -234,6 +288,8 @@ class StateStore:
                 for exchange, snapshot in self.last_balance_snapshots.items()
             },
             "paper_pnl_by_currency": dict(self.paper_pnl_by_currency),
+            "live_pnl_estimate_usd_by_day": dict(self.live_pnl_estimate_usd_by_day),
+            "database_path": str(self.database_path),
             "daily_summary": dict(self.daily_summary),
         }
 
@@ -268,3 +324,15 @@ class StateStore:
             "error_sources": {},
             "last_sent_at": None,
         }
+
+    def _live_pnl_delta(self, record: ExecutionRecord) -> float:
+        """Estimate daily live pnl impact from execution outcomes for safety limits."""
+        if record.mode != "live":
+            return 0.0
+        if record.pnl_currency not in {"USD", "USDT"}:
+            return 0.0
+        if record.status == "live_submitted":
+            return record.expected_pnl
+        if record.status in {"live_partial_failure", "live_error"}:
+            return -abs(record.expected_pnl)
+        return 0.0

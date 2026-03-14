@@ -107,6 +107,7 @@ It polls Telegram with `getUpdates` and supports:
 - `/orders`
 - `/open_orders`
 - `/fills`
+- `/realized_pnl`
 - `/errors`
 - `/pnl`
 - `/risk`
@@ -245,6 +246,7 @@ Opportunity
 -> ExecutionController
 -> RiskManager
 -> PaperExecutor or LiveExecutor
+-> SQLiteLedger
 -> StateStore
 ```
 
@@ -259,6 +261,7 @@ It does the following:
 - reject invalid opportunities cleanly
 - route valid ones to paper or live execution
 - record execution outcomes
+- assign an execution-group id to each execution attempt
 - pause live trading if repeated failures occur
 
 ### PaperExecutor
@@ -298,10 +301,15 @@ Before paper or live execution, each opportunity is checked for:
   - live cross-exchange is currently enabled
 - zero-notional rejection
 - max opportunity notional
+- minimum net profit in USD/USDT terms
+- minimum live net edge after slippage
+- total open-notional portfolio cap
+- daily live-loss estimate kill switch
 - max order notional
 - min order notional
 - exchange min amount / min cost limits
 - current quote slippage guard
+- forward expected slippage estimate from top-of-book depth
 - max quote age / stale quote rejection
 - free balance checks for live execution
 - reserve balance buffer
@@ -317,9 +325,14 @@ From [config.json](C:/Users/calde/OneDrive/Documents/arb_strat/config.json):
 - minimum order notional: `10`
 - maximum order notional: `250`
 - maximum opportunity notional: `500`
+- minimum net profit: `0.25`
+- minimum live net edge: `5 bps`
+- max total open notional: `500`
+- max daily live loss estimate: `50`
 - reserve balance percentage: `5%`
 - max slippage: `10 bps`
-- max quote age: `3000 ms`
+- max quote age cross-exchange: `750 ms`
+- max quote age triangular: `1000 ms`
 - max live orders per cycle: `2`
 - pause on partial fill: `true`
 - reconcile live orders: `true`
@@ -352,11 +365,10 @@ So the effective order is scaled down if needed before submission.
 
 The current risk model does **not** yet include:
 
-- portfolio-wide exposure limits
 - inventory skew limits by coin
 - dynamic volatility scaling
 - cross-venue hedging logic for partial fills
-- kill switch by pnl drawdown
+- fully realized exchange-account pnl reconciliation
 - maker/taker route optimization
 
 ## State tracking phase
@@ -374,6 +386,7 @@ Stored state includes:
 - execution pause state
 - runtime summary fields
 - latest opportunity summary
+- realized-pnl summary passthrough from the SQLite ledger
 
 Files written under `state/`:
 
@@ -381,8 +394,10 @@ Files written under `state/`:
   - latest snapshot
 - `events.jsonl`
   - append-only event stream
+- `arb_strat.db`
+  - SQLite ledger of execution groups, order statuses, fills, and realized pnl
 
-This gives the bot a lightweight operator state layer without needing a database yet.
+This gives the bot both a lightweight JSON operator state layer and a persistent SQLite accounting layer.
 
 ## Operator / monitoring phase
 
@@ -404,6 +419,8 @@ Useful operator views:
   - current open exchange orders
 - `/fills`
   - recent normalized fills
+- `/realized_pnl`
+  - realized pnl for completed execution groups from the SQLite ledger
 - `/errors`
   - recent failures
 - `/balances`
@@ -459,6 +476,7 @@ The bot is much stronger than the initial scaffold, but not fully production-com
 - strategy separation
 - execution controller
 - pre-trade risk checks
+- SQLite-backed order/fill/realized-pnl ledger
 - pause-on-failure behavior
 - runtime state persistence
 - operator Telegram commands

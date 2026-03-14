@@ -13,7 +13,12 @@ def test_load_config(tmp_path):
             {
                 "exchanges": [
                     {"name": "binance", "enabled": True, "taker_fee_bps": 10},
-                    {"name": "okx", "enabled": True, "taker_fee_bps": 10}
+                    {
+                        "name": "okx",
+                        "enabled": True,
+                        "hostname": "my.okx.com",
+                        "taker_fee_bps": 10,
+                    }
                 ],
                 "triangular": {"base_assets": ["BTC", "ETH", "SOL"]}
             }
@@ -24,6 +29,10 @@ def test_load_config(tmp_path):
     config = load_config(config_path)
 
     assert config.enabled_exchange_names() == ("binance", "okx")
+    assert config.exchanges[1].hostname == "my.okx.com"
     assert config.triangular.base_assets == ("BTC", "ETH", "SOL")
     assert config.telegram.daily_summary_enabled is False
     assert config.telegram.daily_summary_timezone == "UTC"
+    assert config.risk.min_net_profit_usd == 0.25
+    assert config.risk.max_quote_age_ms_cross_exchange == 750
+    assert config.state.database_file == "arb_strat.db"

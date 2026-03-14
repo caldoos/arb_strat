@@ -341,6 +341,35 @@ class ArbitrageBot:
             lines.append(f"{currency}: {amount:.8f}")
         return "\n".join(lines)
 
+    def format_realized_pnl(self) -> str:
+        """Show realized pnl totals and recent reconciled execution groups from SQLite."""
+        summary = self.state_store.realized_pnl_summary()
+        totals = summary.get("totals", {})
+        today = summary.get("today", {})
+        recent = summary.get("recent", [])
+        if not totals and not recent:
+            return "No realized pnl recorded yet."
+
+        lines = ["Realized pnl"]
+        if totals:
+            totals_text = ", ".join(
+                f"{currency}={amount:.8f}" for currency, amount in sorted(totals.items())
+            )
+            lines.append(f"all time: {totals_text}")
+        if today:
+            today_text = ", ".join(
+                f"{currency}={amount:.8f}" for currency, amount in sorted(today.items())
+            )
+            lines.append(f"today: {today_text}")
+        for item in recent[:5]:
+            lines.append(
+                (
+                    f"{item['computed_at']} | {item['strategy']} | {item['venue']} | "
+                    f"{item['realized_pnl']:.8f} {item['pnl_currency']} | {item['status']}"
+                )
+            )
+        return "\n".join(lines)
+
     def format_risk(self) -> str:
         """Return the currently configured execution/risk rules."""
         return self.execution_controller.risk_summary()

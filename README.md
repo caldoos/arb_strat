@@ -97,7 +97,7 @@ Environment variables used by the default config:
 - Telegram
   - `TELEGRAM_TOKEN`
   - `TELEGRAM_NOTIFICATION_CHAT_ID`
-  - `TELEGRAM_LOGS_CHAT_ID`
+- `TELEGRAM_LOGS_CHAT_ID`
 
 For live trading, use API keys with trading permission only. Withdrawal permission should stay disabled.
 
@@ -146,6 +146,8 @@ Supported Telegram commands:
   - fetches and shows currently open exchange orders
 - `/fills`
   - shows recent normalized fills from reconciled live orders
+- `/realized_pnl`
+  - shows reconciled realized pnl from the SQLite trade ledger
 - `/errors`
   - shows recent scanner and execution errors
 - `/pnl`
@@ -232,11 +234,16 @@ Live trading is still conservative by default.
 - minimum order notional is `10`
 - maximum order notional is `250`
 - maximum opportunity notional is `500`
+- minimum net profit is `0.25` in USD/USDT terms
+- minimum live net edge is `5 bps`
+- maximum total open notional is `500`
+- maximum daily live loss estimate is `50`
 - balance reserve is `5%`
 - max allowed quote drift before rejection is `10 bps`
-- max quote age before rejection is `3000 ms`
+- max quote age before rejection is `750 ms` for cross-exchange and `1000 ms` for triangular
 - max live orders per cycle is `2`
 - per-exchange inventory caps are configured for BTC, ETH, SOL, USD, and USDT
+- expected slippage is estimated from top-of-book depth and spread before execution
 - any partial live fill pauses execution immediately
 - live orders are reconciled after submission for up to `3` polls with `1s` spacing
 - accepted legs are canceled on later-leg failure when possible
@@ -252,6 +259,8 @@ Runtime state is stored under `state/` by default.
   - latest runtime snapshot, balances, recent executions, recent order statuses, recent fills, recent errors
 - `events.jsonl`
   - append-only event log for executions, order statuses, fills, balance snapshots, pause state changes, and errors
+- `arb_strat.db`
+  - SQLite ledger for execution groups, order statuses, fills, and realized pnl
 
 The bot now keeps:
 
@@ -260,6 +269,7 @@ The bot now keeps:
 - recent error records
 - latest wallet snapshots by exchange
 - simulated paper pnl totals by currency
+- reconciled realized pnl for completed live cross-exchange groups
 - execution pause state
 - rolling daily summary counters
 
@@ -321,9 +331,12 @@ That is a valid result and just means the current quotes did not pass the config
 - Order placement is still REST-based, which is normal for a first live version but still slower than a colocated low-latency stack.
 - The WebSocket layer is intended to reduce stale-quote risk, not eliminate execution risk. Slippage, partial fills, and exchange-side latency still matter.
 - Live execution now passes through risk checks before any order is submitted: strategy allowlist, notional caps, exchange min limits, free-balance checks, slippage guardrails, and an automatic pause on repeated failures.
+- Live execution now also applies a post-cost profit gate: expected pnl is reduced by an estimated slippage cost before the trade is allowed through.
+- A portfolio-level open-notional cap and a daily live-loss estimate are now enforced to keep live deployment conservative.
 - Logging goes to both stdout and `logs/arb_strat.log`.
 - Warning and error logs can also be forwarded to the Telegram logs chat when Telegram is enabled.
 - Quote and fee assumptions are still simplified. Before using meaningful capital, add order-status reconciliation, partial-fill recovery, persistent trade history, and venue-specific maker/taker routing.
+- Live accounting now uses a local SQLite ledger so fills and realized pnl survive process restarts on the same machine.
 - Adding more exchanges later is straightforward: extend the supported exchange list, add credentials if needed, and confirm symbol coverage for the markets you care about.
 
 ## Market data path

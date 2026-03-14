@@ -44,6 +44,7 @@ def _build_bot() -> tuple[TelegramCommandBot, FakeNotifier]:
             orders=lambda: "orders ok",
             open_orders=lambda: "open orders ok",
             fills=lambda: "fills ok",
+            realized_pnl=lambda: "realized pnl ok",
             errors=lambda: "errors ok",
             pnl=lambda: "pnl ok",
             risk=lambda: "risk ok",
@@ -64,6 +65,7 @@ def test_command_bot_help_dispatch():
 
     assert notifier.sent_messages
     assert "/status" in notifier.sent_messages[0][1]
+    assert "/realized_pnl" in notifier.sent_messages[0][1]
 
 
 def test_command_bot_rejects_unauthorized_chat():
@@ -82,3 +84,12 @@ def test_command_bot_heartbeat_dispatch_with_argument():
     bot._handle_update({"message": {"chat": {"id": "111"}, "text": "/heartbeat ON"}})
 
     assert notifier.sent_messages == [("111", "heartbeat on")]
+
+
+def test_command_bot_realized_pnl_dispatch():
+    """Ensure realized-pnl requests route to the ledger-backed handler."""
+    bot, notifier = _build_bot()
+
+    bot._handle_update({"message": {"chat": {"id": "111"}, "text": "/realized_pnl"}})
+
+    assert notifier.sent_messages == [("111", "realized pnl ok")]

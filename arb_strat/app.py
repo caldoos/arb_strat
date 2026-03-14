@@ -74,6 +74,7 @@ def main() -> int:
             orders=bot.format_orders,
             open_orders=bot.format_open_orders,
             fills=bot.format_fills,
+            realized_pnl=bot.format_realized_pnl,
             errors=bot.format_errors,
             pnl=bot.format_pnl,
             risk=bot.format_risk,

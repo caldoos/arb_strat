@@ -10,7 +10,7 @@ from arb_strat.config import (
 )
 from arb_strat.execution.controller import ExecutionController
 from arb_strat.execution.live import LiveExecutionError
-from arb_strat.models import Opportunity, OrderIntent, Quote
+from arb_strat.models import Opportunity, OrderIntent, OrderStatusRecord, Quote
 from arb_strat.state import StateStore
 
 
@@ -75,6 +75,14 @@ class FakeClient:
             "datetime": "2026-03-12T00:00:00+00:00",
         }
 
+    def load_markets(self):
+        """Provide a no-op load_markets hook for parity with the real adapter."""
+        return None
+
+    def supported_symbols(self):
+        """Expose the fake quote symbol as a supported market."""
+        return {self._quote.symbol}
+
 
 class FakePaperExecutor:
     """Paper executor double that captures the prepared opportunity."""
@@ -120,6 +128,25 @@ class AcceptLiveExecutor:
         return [{"id": "accepted-order", "symbol": "BTC/USDT", "side": "buy", "amount": opportunity.orders[0].amount, "price": opportunity.orders[0].price}]
 
 
+class AcceptMultiLegLiveExecutor:
+    """Live executor double that returns one accepted response per planned order."""
+
+    def execute(self, opportunity):
+        """Simulate clean exchange responses for each submitted leg."""
+        responses = []
+        for index, order in enumerate(opportunity.orders, start=1):
+            responses.append(
+                {
+                    "id": f"accepted-order-{index}",
+                    "symbol": order.symbol,
+                    "side": order.side,
+                    "amount": order.amount,
+                    "price": order.price,
+                }
+            )
+        return responses
+
+
 def _config(tmp_path, **risk_overrides):
     """Build a minimal app config with overridable risk settings."""
     defaults = {
@@ -151,6 +178,34 @@ def _opportunity(strategy="cross_exchange"):
                 side="buy",
                 price=100.0,
                 amount=2.0,
+            ),
+        ),
+    )
+
+
+def _paired_opportunity():
+    """Create a two-leg cross-exchange opportunity for realized-pnl tests."""
+    return Opportunity(
+        strategy="cross_exchange",
+        venue="binance -> okx",
+        summary="Buy BTC on binance, sell on okx",
+        edge_bps=25.0,
+        expected_pnl=1.5,
+        pnl_currency="USDT",
+        orders=(
+            OrderIntent(
+                exchange="binance",
+                symbol="BTC/USDT",
+                side="buy",
+                price=100.0,
+                amount=1.0,
+            ),
+            OrderIntent(
+                exchange="okx",
+                symbol="BTC/USDT",
+                side="sell",
+                price=101.5,
+                amount=1.0,
             ),
         ),
     )
@@ -352,3 +407,185 @@ def test_partial_failure_attempts_cancel(tmp_path):
 
     assert record.status == "live_partial_failure"
     assert client.cancelled_orders == [("accepted-order", "BTC/USDT")]
+
+
+def test_low_net_profit_is_rejected_after_slippage(tmp_path):
+    """Post-cost net profit checks should reject weak trades after slippage is estimated."""
+    config = _config(
+        tmp_path,
+        min_net_profit_usd=2.0,
+        max_quote_age_ms_cross_exchange=10_000,
+    )
+    quote = Quote(
+        "BTC/USDT",
+        bid=99.4,
+        ask=100.0,
+        bid_size=10.0,
+        ask_size=10.0,
+        timestamp_ms=int(time.time() * 1000),
+    )
+    state_store = StateStore(config.state)
+    controller = ExecutionController(
+        config,
+        {"binance": FakeClient(quote=quote)},
+        state_store,
+    )
+
+    record = controller.execute(_opportunity(), live=False)
+
+    assert record.status == "rejected"
+    assert "net pnl" in record.reason
+
+
+def test_open_notional_cap_rejects_new_live_order(tmp_path):
+    """Live execution should respect the total in-flight open notional cap."""
+    config = _config(
+        tmp_path,
+        allow_live_cross_exchange=True,
+        max_quote_age_ms_cross_exchange=10_000,
+        max_total_open_notional_usd=250.0,
+    )
+    state_store = StateStore(config.state)
+    state_store.record_order_status(
+        OrderStatusRecord(
+            exchange="binance",
+            symbol="BTC/USDT",
+            order_id="open-1",
+            side="buy",
+            amount=2.0,
+            price=100.0,
+            status="open",
+            filled=0.0,
+            remaining=2.0,
+            timestamp="2026-03-12T00:00:00+00:00",
+        )
+    )
+    controller = ExecutionController(config, {"binance": FakeClient()}, state_store)
+    controller.live_executor = AcceptLiveExecutor()
+
+    record = controller.execute(_opportunity(), live=True)
+
+    assert record.status == "rejected"
+    assert "portfolio cap" in record.reason
+
+
+def test_daily_loss_limit_blocks_next_live_trade(tmp_path):
+    """A breached daily live-loss limit should pause and reject subsequent live trades."""
+    config = _config(
+        tmp_path,
+        allow_live_cross_exchange=True,
+        max_quote_age_ms_cross_exchange=10_000,
+        max_daily_loss_usd=1.0,
+    )
+    state_store = StateStore(config.state)
+    controller = ExecutionController(config, {"binance": FakeClient()}, state_store)
+    controller.live_executor = AlwaysFailLiveExecutor()
+
+    controller.execute(_opportunity(), live=True)
+    record = controller.execute(_opportunity(), live=True)
+
+    assert record.status == "rejected"
+    assert "daily live loss limit" in record.reason
+    assert state_store.is_execution_paused() is True
+
+
+def test_cross_exchange_uses_tighter_quote_age_limit(tmp_path):
+    """Cross-exchange should use its own tighter quote-age threshold instead of the fallback."""
+    config = _config(
+        tmp_path,
+        max_quote_age_ms=10_000,
+        max_quote_age_ms_cross_exchange=5,
+    )
+    stale_quote = Quote(
+        "BTC/USDT",
+        bid=100.0,
+        ask=100.0,
+        bid_size=10.0,
+        ask_size=10.0,
+        timestamp_ms=int(time.time() * 1000) - 50,
+    )
+    state_store = StateStore(config.state)
+    controller = ExecutionController(
+        config,
+        {"binance": FakeClient(quote=stale_quote)},
+        state_store,
+    )
+
+    record = controller.execute(_opportunity(), live=False)
+
+    assert record.status == "rejected"
+    assert "quote age" in record.reason
+
+
+def test_completed_cross_exchange_group_records_realized_pnl(tmp_path):
+    """A fully filled two-leg cross-exchange trade should produce realized pnl in SQLite."""
+    config = AppConfig(
+        exchanges=(ExchangeSettings(name="binance"), ExchangeSettings(name="okx")),
+        risk=RiskSettings(
+            allow_live_cross_exchange=True,
+            max_quote_age_ms_cross_exchange=10_000,
+            reconcile_live_orders=True,
+        ),
+        state=StateSettings(directory=str(tmp_path)),
+    )
+    binance = FakeClient(
+        quote=Quote(
+            "BTC/USDT",
+            bid=99.9,
+            ask=100.0,
+            bid_size=10.0,
+            ask_size=10.0,
+            timestamp_ms=int(time.time() * 1000),
+        )
+    )
+    okx = FakeClient(
+        quote=Quote(
+            "BTC/USDT",
+            bid=101.5,
+            ask=101.6,
+            bid_size=10.0,
+            ask_size=10.0,
+            timestamp_ms=int(time.time() * 1000),
+        )
+    )
+    binance.order_lookup["accepted-order-1"] = {
+        "id": "accepted-order-1",
+        "symbol": "BTC/USDT",
+        "side": "buy",
+        "amount": 1.0,
+        "price": 100.0,
+        "average": 100.0,
+        "filled": 1.0,
+        "remaining": 0.0,
+        "status": "closed",
+        "datetime": "2026-03-12T00:00:00+00:00",
+        "fee": {"cost": 0.1, "currency": "USDT"},
+    }
+    okx.order_lookup["accepted-order-2"] = {
+        "id": "accepted-order-2",
+        "symbol": "BTC/USDT",
+        "side": "sell",
+        "amount": 1.0,
+        "price": 101.5,
+        "average": 101.5,
+        "filled": 1.0,
+        "remaining": 0.0,
+        "status": "closed",
+        "datetime": "2026-03-12T00:00:00+00:00",
+        "fee": {"cost": 0.1, "currency": "USDT"},
+    }
+    state_store = StateStore(config.state)
+    controller = ExecutionController(
+        config,
+        {"binance": binance, "okx": okx},
+        state_store,
+    )
+    controller.live_executor = AcceptMultiLegLiveExecutor()
+
+    record = controller.execute(_paired_opportunity(), live=True)
+
+    assert record.status == "live_submitted"
+    summary = state_store.realized_pnl_summary()
+    assert "USDT" in summary["totals"]
+    assert summary["totals"]["USDT"] > 0
+    assert summary["recent"][0]["status"] == "complete"

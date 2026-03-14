@@ -28,6 +28,7 @@ class CommandHandlers:
     orders: Callable[[], str]
     open_orders: Callable[[], str]
     fills: Callable[[], str]
+    realized_pnl: Callable[[], str]
     errors: Callable[[], str]
     pnl: Callable[[], str]
     risk: Callable[[], str]
@@ -177,6 +178,8 @@ class TelegramCommandBot:
             return self.handlers.open_orders()
         if command == "/fills":
             return self.handlers.fills()
+        if command == "/realized_pnl":
+            return self.handlers.realized_pnl()
         if command == "/errors":
             return self.handlers.errors()
         if command == "/pnl":
@@ -207,6 +210,7 @@ class TelegramCommandBot:
             "/orders - recent paper/live execution records\n"
             "/open_orders - currently open exchange orders\n"
             "/fills - recent normalized fills\n"
+            "/realized_pnl - reconciled realized pnl from SQLite ledger\n"
             "/errors - recent scanner/execution errors\n"
             "/pnl - simulated pnl totals by currency\n"
             "/risk - current execution and risk rules\n"

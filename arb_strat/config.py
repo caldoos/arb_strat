@@ -15,6 +15,7 @@ class ExchangeSettings:
     name: str
     enabled: bool = True
     sandbox: bool = False
+    hostname: str | None = None
     taker_fee_bps: float = 10.0
     api_key_env: str | None = None
     secret_env: str | None = None
@@ -99,9 +100,15 @@ class RiskSettings:
     min_order_notional: float = 10.0
     max_order_notional: float = 250.0
     max_opportunity_notional: float = 500.0
+    min_net_profit_usd: float = 0.25
+    min_net_profit_bps_live: float = 5.0
+    max_total_open_notional_usd: float = 500.0
+    max_daily_loss_usd: float = 50.0
     reserve_balance_pct: float = 0.05
     max_slippage_bps: float = 10.0
     max_quote_age_ms: int = 3_000
+    max_quote_age_ms_cross_exchange: int = 750
+    max_quote_age_ms_triangular: int = 1_000
     max_live_orders_per_cycle: int = 2
     max_consecutive_failures: int = 3
     pause_on_partial_fill: bool = True
@@ -121,6 +128,7 @@ class StateSettings:
     directory: str = "state"
     snapshot_file: str = "runtime_state.json"
     event_log_file: str = "events.jsonl"
+    database_file: str = "arb_strat.db"
     max_recent_records: int = 50
 
 
@@ -183,6 +191,7 @@ def _parse_exchange_settings(raw: dict[str, object]) -> ExchangeSettings:
         name=name,
         enabled=bool(raw.get("enabled", True)),
         sandbox=bool(raw.get("sandbox", False)),
+        hostname=_maybe_string(raw.get("hostname")),
         taker_fee_bps=float(raw.get("taker_fee_bps", 10.0)),
         api_key_env=_maybe_string(raw.get("api_key_env")),
         secret_env=_maybe_string(raw.get("secret_env")),
@@ -286,9 +295,15 @@ def _parse_risk_settings(raw: dict[str, object]) -> RiskSettings:
         min_order_notional=float(raw.get("min_order_notional", 10.0)),
         max_order_notional=float(raw.get("max_order_notional", 250.0)),
         max_opportunity_notional=float(raw.get("max_opportunity_notional", 500.0)),
+        min_net_profit_usd=float(raw.get("min_net_profit_usd", 0.25)),
+        min_net_profit_bps_live=float(raw.get("min_net_profit_bps_live", 5.0)),
+        max_total_open_notional_usd=float(raw.get("max_total_open_notional_usd", 500.0)),
+        max_daily_loss_usd=float(raw.get("max_daily_loss_usd", 50.0)),
         reserve_balance_pct=float(raw.get("reserve_balance_pct", 0.05)),
         max_slippage_bps=float(raw.get("max_slippage_bps", 10.0)),
         max_quote_age_ms=int(raw.get("max_quote_age_ms", 3_000)),
+        max_quote_age_ms_cross_exchange=int(raw.get("max_quote_age_ms_cross_exchange", 750)),
+        max_quote_age_ms_triangular=int(raw.get("max_quote_age_ms_triangular", 1_000)),
         max_live_orders_per_cycle=int(raw.get("max_live_orders_per_cycle", 2)),
         max_consecutive_failures=int(raw.get("max_consecutive_failures", 3)),
         pause_on_partial_fill=bool(raw.get("pause_on_partial_fill", True)),
@@ -310,6 +325,7 @@ def _parse_state_settings(raw: dict[str, object]) -> StateSettings:
         directory=str(raw.get("directory", "state")),
         snapshot_file=str(raw.get("snapshot_file", "runtime_state.json")),
         event_log_file=str(raw.get("event_log_file", "events.jsonl")),
+        database_file=str(raw.get("database_file", "arb_strat.db")),
         max_recent_records=int(raw.get("max_recent_records", 50)),
     )
 

@@ -45,6 +45,12 @@ class RiskManager:
 
         if live and self.state_store.is_execution_paused():
             raise RiskViolation("execution is paused")
+        if live and self._daily_loss_limit_reached():
+            self.state_store.set_execution_paused(
+                True,
+                reason="paused because the daily live loss limit was reached",
+            )
+            raise RiskViolation("daily live loss limit reached")
         if live and not self._strategy_allowed(opportunity.strategy):
             raise RiskViolation(f"live execution disabled for strategy {opportunity.strategy}")
 
@@ -60,6 +66,7 @@ class RiskManager:
 
         balance_snapshots: list[BalanceSnapshot] = []
         balance_cache: dict[str, dict[str, float]] = {}
+        latest_quotes: dict[tuple[str, str, str], object] = {}
 
         for order in opportunity.orders:
             client = clients[order.exchange]
@@ -68,7 +75,8 @@ class RiskManager:
                 scaling_factors.append(
                     min(1.0, self.config.risk.max_order_notional / order_notional)
                 )
-            self._validate_market_snapshot(client, order)
+            quote = self._validate_market_snapshot(client, order, opportunity.strategy)
+            latest_quotes[(order.exchange, order.symbol, order.side)] = quote
 
             if live:
                 if order.exchange not in balance_cache:
@@ -110,8 +118,48 @@ class RiskManager:
                 )
             )
 
-        normalized_opportunity = replace(opportunity, orders=tuple(normalized_orders))
+        expected_slippage_cost, expected_slippage_bps = self._estimate_expected_slippage(
+            normalized_orders,
+            latest_quotes,
+        )
         total_notional = sum(order.amount * order.price for order in normalized_orders)
+        reference_notional = self._reference_notional(normalized_orders)
+        scaled_expected_pnl = opportunity.expected_pnl * scale
+        net_expected_pnl = scaled_expected_pnl - expected_slippage_cost
+        net_edge_bps = (
+            (net_expected_pnl / reference_notional) * 10000.0
+            if reference_notional > 0
+            else 0.0
+        )
+
+        self._validate_net_profit(
+            opportunity=opportunity,
+            live=live,
+            net_expected_pnl=net_expected_pnl,
+            net_edge_bps=net_edge_bps,
+        )
+        if live:
+            self._validate_open_notional_cap(total_notional)
+
+        metadata = dict(opportunity.metadata)
+        metadata.update(
+            {
+                "raw_expected_pnl": opportunity.expected_pnl,
+                "scaled_expected_pnl": scaled_expected_pnl,
+                "expected_slippage_cost": expected_slippage_cost,
+                "expected_slippage_bps": expected_slippage_bps,
+                "net_expected_pnl": net_expected_pnl,
+                "net_edge_bps": net_edge_bps,
+                "reference_notional": reference_notional,
+            }
+        )
+        normalized_opportunity = replace(
+            opportunity,
+            orders=tuple(normalized_orders),
+            expected_pnl=net_expected_pnl,
+            edge_bps=net_edge_bps,
+            metadata=metadata,
+        )
         return PreparedOpportunity(
             opportunity=normalized_opportunity,
             total_notional=total_notional,
@@ -156,13 +204,19 @@ class RiskManager:
             f"min order notional: {settings.min_order_notional:.2f}\n"
             f"max order notional: {settings.max_order_notional:.2f}\n"
             f"max opportunity notional: {settings.max_opportunity_notional:.2f}\n"
+            f"min net profit usd: {settings.min_net_profit_usd:.2f}\n"
+            f"min net profit bps (live): {settings.min_net_profit_bps_live:.2f}\n"
+            f"max total open notional usd: {settings.max_total_open_notional_usd:.2f}\n"
+            f"max daily loss usd: {settings.max_daily_loss_usd:.2f}\n"
             f"reserve balance pct: {settings.reserve_balance_pct:.2%}\n"
             f"max slippage: {settings.max_slippage_bps:.2f} bps\n"
-            f"max quote age: {settings.max_quote_age_ms} ms\n"
+            f"max quote age cross-exchange: {settings.max_quote_age_ms_cross_exchange} ms\n"
+            f"max quote age triangular: {settings.max_quote_age_ms_triangular} ms\n"
             f"max live orders per cycle: {settings.max_live_orders_per_cycle}\n"
             f"max consecutive failures: {settings.max_consecutive_failures}\n"
             f"pause on partial fill: {'yes' if settings.pause_on_partial_fill else 'no'}\n"
             f"inventory caps configured: {'yes' if settings.max_asset_balance_by_exchange else 'no'}\n"
+            f"current live pnl estimate usd: {self.state_store.current_live_pnl_estimate_usd():.2f}\n"
             f"execution paused: {'yes' if self.state_store.is_execution_paused() else 'no'}"
         )
 
@@ -174,10 +228,10 @@ class RiskManager:
             return self.config.risk.allow_live_cross_exchange
         return False
 
-    def _validate_market_snapshot(self, client: object, order: OrderIntent) -> None:
+    def _validate_market_snapshot(self, client: object, order: OrderIntent, strategy: str):
         """Check quote freshness and slippage against the intended execution price."""
         quote = client.fetch_top_of_book(order.symbol)
-        self._validate_quote_freshness(order, quote.timestamp_ms)
+        self._validate_quote_freshness(order, quote.timestamp_ms, strategy)
         slippage_multiplier = self.config.risk.max_slippage_bps / 10000.0
         if order.side == "buy":
             allowed_price = order.price * (1.0 + slippage_multiplier)
@@ -186,7 +240,7 @@ class RiskManager:
                     f"{order.exchange} {order.symbol} ask moved to {quote.ask:.8f}, above "
                     f"allowed {allowed_price:.8f}"
                 )
-            return
+            return quote
 
         allowed_price = order.price * (1.0 - slippage_multiplier)
         if quote.bid < allowed_price:
@@ -194,10 +248,16 @@ class RiskManager:
                 f"{order.exchange} {order.symbol} bid moved to {quote.bid:.8f}, below "
                 f"allowed {allowed_price:.8f}"
             )
+        return quote
 
-    def _validate_quote_freshness(self, order: OrderIntent, timestamp_ms: int | None) -> None:
+    def _validate_quote_freshness(
+        self,
+        order: OrderIntent,
+        timestamp_ms: int | None,
+        strategy: str,
+    ) -> None:
         """Reject orders when the last quote update is missing or stale."""
-        max_age_ms = self.config.risk.max_quote_age_ms
+        max_age_ms = self._quote_age_limit_ms(strategy)
         if max_age_ms <= 0:
             return
         if timestamp_ms is None:
@@ -298,3 +358,91 @@ class RiskManager:
             raise RiskViolation(
                 f"{symbol} notional {notional:.8f} is below exchange minimum {float(min_cost):.8f}"
             )
+
+    def _estimate_expected_slippage(
+        self,
+        orders: list[OrderIntent],
+        latest_quotes: dict[tuple[str, str, str], object],
+    ) -> tuple[float, float]:
+        """Estimate total execution slippage cost from top-of-book depth and spread."""
+        total_cost = 0.0
+        max_bps = 0.0
+        for order in orders:
+            quote = latest_quotes.get((order.exchange, order.symbol, order.side))
+            if quote is None:
+                continue
+            order_notional = order.amount * order.price
+            if order.side == "buy":
+                available_notional = quote.ask_size * quote.ask
+            else:
+                available_notional = quote.bid_size * quote.bid
+            if available_notional <= 0:
+                raise RiskViolation(f"{order.exchange} {order.symbol} has no executable top-of-book depth")
+
+            mid_price = (quote.ask + quote.bid) / 2.0
+            if mid_price <= 0:
+                continue
+            spread_bps = max(0.0, ((quote.ask - quote.bid) / mid_price) * 10000.0)
+            impact_ratio = max(0.0, order_notional / available_notional)
+            expected_bps = impact_ratio * spread_bps * 0.5
+            if expected_bps > self.config.risk.max_slippage_bps:
+                raise RiskViolation(
+                    f"{order.exchange} {order.symbol} estimated slippage {expected_bps:.2f} bps exceeds "
+                    f"max {self.config.risk.max_slippage_bps:.2f} bps"
+                )
+            total_cost += order_notional * (expected_bps / 10000.0)
+            max_bps = max(max_bps, expected_bps)
+        return total_cost, max_bps
+
+    def _reference_notional(self, orders: list[OrderIntent]) -> float:
+        """Return the notional used to convert net pnl into a bps-style threshold."""
+        buy_notional = sum(order.amount * order.price for order in orders if order.side == "buy")
+        if buy_notional > 0:
+            return buy_notional
+        return sum(order.amount * order.price for order in orders)
+
+    def _validate_net_profit(
+        self,
+        *,
+        opportunity: Opportunity,
+        live: bool,
+        net_expected_pnl: float,
+        net_edge_bps: float,
+    ) -> None:
+        """Reject opportunities that no longer clear post-cost profit floors."""
+        if net_expected_pnl < self.config.risk.min_net_profit_usd:
+            raise RiskViolation(
+                f"{opportunity.summary} net pnl {net_expected_pnl:.6f} {opportunity.pnl_currency} "
+                f"is below minimum {self.config.risk.min_net_profit_usd:.6f}"
+            )
+        if live and net_edge_bps < self.config.risk.min_net_profit_bps_live:
+            raise RiskViolation(
+                f"{opportunity.summary} net edge {net_edge_bps:.2f} bps is below live minimum "
+                f"{self.config.risk.min_net_profit_bps_live:.2f} bps"
+            )
+
+    def _validate_open_notional_cap(self, new_notional: float) -> None:
+        """Reject live orders that would breach the total in-flight portfolio cap."""
+        cap = self.config.risk.max_total_open_notional_usd
+        if cap <= 0:
+            return
+        current_open = self.state_store.open_notional_estimate()
+        if current_open + new_notional > cap:
+            raise RiskViolation(
+                f"open notional {current_open + new_notional:.2f} would exceed portfolio cap {cap:.2f}"
+            )
+
+    def _quote_age_limit_ms(self, strategy: str) -> int:
+        """Return the per-strategy quote age threshold with a backward-compatible fallback."""
+        if strategy == "cross_exchange":
+            return self.config.risk.max_quote_age_ms_cross_exchange
+        if strategy == "triangular":
+            return self.config.risk.max_quote_age_ms_triangular
+        return self.config.risk.max_quote_age_ms
+
+    def _daily_loss_limit_reached(self) -> bool:
+        """Return whether the current UTC-day live pnl estimate is below the configured floor."""
+        limit = self.config.risk.max_daily_loss_usd
+        if limit <= 0:
+            return False
+        return self.state_store.current_live_pnl_estimate_usd() <= -limit
